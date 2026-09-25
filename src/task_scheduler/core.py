@@ -274,6 +274,11 @@ class Scheduler:
 
         env = dict(os.environ)
         env.update(json.loads(task["env_json"] or "{}"))
+        # Datasets resolved at admit inject their dir via the named env var.
+        for s in json.loads(task["datasets_json"] or "[]"):
+            if s.get("env") and s.get("resolved_dir"):
+                env[s["env"]] = s["resolved_dir"]
+        env["SCHED_DATASETS_DIR"] = str(self.datasets_root())
         # Host tools (uv, cargo, …) live outside the service's minimal PATH —
         # prepend configured dirs so tasks can call them by name.
         extra = [str(Path(p).expanduser()) for p in self.cfg.task_path_extra]
@@ -392,9 +397,41 @@ class Scheduler:
                 except (OSError, subprocess.SubprocessError):
                     pass
 
+    def datasets_root(self) -> Path:
+        return self.cfg.data_dir / "datasets"
+
+    def resolve_dataset(self, name: str, version: str | None) -> Path:
+        """Resolve a dataset name+version to its directory."""
+        root = self.datasets_root() / name
+        if not version or version == "latest":
+            link = root / "latest"
+            if link.is_symlink():
+                t = root / os.readlink(link)
+                if t.is_dir():
+                    return t
+            raise FileNotFoundError(f"dataset {name}: no versions uploaded")
+        d = root / version
+        if not d.is_dir():
+            raise FileNotFoundError(f"dataset {name}@{version} not found")
+        return d
+
+    def _materialize_datasets(self, task: dict) -> None:
+        """Resolve dataset specs at admit; fail fast if any are missing."""
+        specs = json.loads(task["datasets_json"] or "[]")
+        if not specs:
+            return
+        for s in specs:
+            d = self.resolve_dataset(s["name"], s.get("version"))
+            s["resolved_version"] = d.name
+            s["resolved_dir"] = str(d)
+        js = json.dumps(specs)
+        self.db.update_task(task["id"], datasets_json=js)
+        task["datasets_json"] = js
+
     def _admit(self, task: dict) -> None:
         if task["repo_source"]:
             self._materialize_worktree(task)
+        self._materialize_datasets(task)
         phase = "setup" if task["setup_command"] else "command"
         command = task["setup_command"] if phase == "setup" else task["command"]
         self._spawn_phase(task, phase, command)

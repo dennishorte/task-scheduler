@@ -297,6 +297,19 @@ setsid sh -c '
   `task_path_extra` dirs (default `~/.local/bin`, `~/bin`, `~/.cargo/bin`)
   prepended to PATH so user-level tools resolve by name.
 
+### 6.1a Datasets
+
+Named, versioned read-only data bundles for inputs too big for git
+(generated worlds, corpora). `POST /v1/datasets/{name}?version=` uploads a
+tar bundle to `data_dir/datasets/{name}/{version}/` with an auto-bumped
+`latest` symlink. Tasks declare `datasets: [{name, version?, env?}]`; at
+admit the scheduler resolves each spec (fail-fast if missing), records
+`resolved_version`/`resolved_dir`, and injects `env` → resolved dir into the
+task's environment (`SCHED_DATASETS_DIR` is always set to the root). The
+bundle layout and any `manifest.json` (version + sha256s) is the project's
+contract — the scheduler just hosts and pins the bytes. Delete is refused
+while a running task references the version.
+
 - stdout/stderr → `stdout.log`/`stderr.log`. On reaching `log_max_bytes`
   (config, 64 MB): append a truncation marker line and **stop writing** —
   offsets held by `/log` clients stay valid; `/log` past the marker returns
@@ -366,6 +379,10 @@ cross-project ops + UI). Timestamps are ISO-8601 UTC with milliseconds
 | `GET /v1/tasks/{id}/log?stream=stdout|stderr&offset=&tail=` | log fetch; `offset` for incremental follow (stable across truncation, §6.1) |
 | `GET /v1/tasks/{id}/files?prefix=` | list artifacts + workdir files; `prefix` required for workdir listings, capped at 1000 entries |
 | `GET /v1/tasks/{id}/files/{path}` | download; path must `resolve()` under task dir **or** workdir — symlink-safe prefix check against both roots, not a `..` string check |
+| `POST /v1/datasets/{name}?version=` | upload a tar/`.tar.gz` bundle → `datasets/{name}/{version}/`, bumps `latest`; `?replace=1` overwrites. Body streamed to disk, extracted with `filter="data"` (no escapes/specials) |
+| `GET /v1/datasets` | list names, versions, latest, sizes |
+| `GET /v1/datasets/{name}/{version}/manifest` | the bundle's `manifest.json` (project-side verify/publish contract) |
+| `DELETE /v1/datasets/{name}/{version}` | GC a version; 409 while a running task references it |
 | `GET /v1/queue` | slots used/free, mem used/free, per-project running/queued, uptime, `degraded` flags (e.g. low disk) |
 | `GET /v1/health` | liveness + degradation |
 

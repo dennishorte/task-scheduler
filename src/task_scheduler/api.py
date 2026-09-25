@@ -7,6 +7,11 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import shutil
+import tarfile
+import tempfile
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,7 +29,10 @@ KNOWN_FIELDS = {
     "project", "command", "workdir", "repo", "workdir_subdir", "setup_command",
     "env", "secret_env", "cores", "mem_mb", "est_seconds", "timeout_seconds",
     "labels", "idempotency_key", "artifact_patterns", "verdict_pattern",
+    "datasets",
 }
+DATASET_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 STATIC_DIR = Path(__file__).parent / "static"
 
 
@@ -58,6 +66,10 @@ def task_public(task: dict) -> dict:
             out["repo"] = spec
         except (json.JSONDecodeError, TypeError):
             pass
+    try:
+        out["datasets"] = json.loads(out.pop("datasets_json") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        out["datasets"] = []
     return out
 
 
@@ -179,6 +191,26 @@ def validate_task(data: dict, cfg: Config, in_batch: bool,
     if idem is not None and not isinstance(idem, str):
         errors.append("idempotency_key must be a string")
 
+    datasets = data.get("datasets", [])
+    if not isinstance(datasets, list):
+        errors.append("datasets must be a list")
+    else:
+        for i, d in enumerate(datasets):
+            if not isinstance(d, dict):
+                errors.append(f"datasets[{i}]: must be an object")
+                continue
+            name = d.get("name")
+            if not isinstance(name, str) or not DATASET_NAME_RE.match(name or ""):
+                errors.append(f"datasets[{i}].name: required ({DATASET_NAME_RE.pattern})")
+            ver = d.get("version", "latest")
+            if not isinstance(ver, str) or not DATASET_NAME_RE.match(ver or ""):
+                errors.append(f"datasets[{i}].version: invalid")
+            ev = d.get("env")
+            if ev is not None and not (
+                isinstance(ev, str) and ENV_NAME_RE.match(ev)
+            ):
+                errors.append(f"datasets[{i}].env: invalid env var name")
+
     patterns = data.get("artifact_patterns", [])
     if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
         errors.append("artifact_patterns must be a list of strings")
@@ -226,6 +258,7 @@ def validate_task(data: dict, cfg: Config, in_batch: bool,
         "payload_hash": payload_hash,
         "secret_env_keys": json.dumps(sorted(secret_env)) if secret_env else None,
         "artifact_patterns_json": json.dumps(patterns),
+        "datasets_json": json.dumps(datasets) if datasets else None,
         "artifacts_json": None,
         "verdict_pattern": verdict,
         "verdict": None,
@@ -639,6 +672,146 @@ def create_app(config_path: str | Path) -> FastAPI:
         if not p.is_file():
             raise api_error(404, "not_found", f"no file {path}")
         return FileResponse(p)
+
+    # -------------------------------------------------------------- datasets
+    # Named, versioned read-only data bundles shared across tasks. Upload a
+    # tar archive; tasks reference {"name", "version"?, "env"?} and the
+    # resolved directory is injected as an env var at admit time.
+
+    def datasets_root() -> Path:
+        return cfg.data_dir / "datasets"
+
+    def dataset_versions(name: str) -> list[str]:
+        root = datasets_root() / name
+        if not root.is_dir():
+            return []
+        return sorted(
+            d.name for d in root.iterdir()
+            if d.is_dir() and not d.is_symlink() and not d.name.startswith(".")
+        )
+
+    def dataset_latest(name: str) -> str | None:
+        link = datasets_root() / name / "latest"
+        try:
+            return os.readlink(link)
+        except OSError:
+            return None
+
+    def dir_bytes(path: Path) -> int:
+        total = 0
+        for p in path.rglob("*"):
+            if p.is_file():
+                total += p.stat().st_size
+        return total
+
+    @app.post("/v1/datasets/{name}", status_code=201)
+    async def upload_dataset(request: Request, name: str,
+                             version: str | None = None,
+                             replace: bool = False,
+                             princ=Depends(principal)):
+        request.state.princ = princ
+        if not DATASET_NAME_RE.match(name):
+            raise api_error(400, "validation",
+                            f"bad dataset name ({DATASET_NAME_RE.pattern})")
+        version = version or f"v{int(time.time())}"
+        if not DATASET_NAME_RE.match(version):
+            raise api_error(400, "validation", "bad version string")
+        root = datasets_root() / name
+        dest = root / version
+        if dest.exists() and not replace:
+            raise api_error(409, "conflict",
+                          f"dataset {name}@{version} exists (use ?replace=1)")
+        root.mkdir(parents=True, exist_ok=True)
+
+        # Stream the archive to disk first — bundles can be ~GBs.
+        fd, archive = tempfile.mkstemp(dir=root, prefix=".upload-")
+        total = 0
+        try:
+            with os.fdopen(fd, "wb") as f:
+                async for chunk in request.stream():
+                    total += len(chunk)
+                    if total > cfg.max_dataset_bytes:
+                        raise api_error(413, "too_large",
+                                        f"dataset exceeds {cfg.max_dataset_bytes} bytes")
+                    f.write(chunk)
+            tmpdir = root / f".extracting-{secrets.token_hex(6)}"
+            tmpdir.mkdir()
+            try:
+                with tarfile.open(archive, "r|*") as tf:
+                    tf.extractall(tmpdir, filter="data")
+            except (tarfile.TarError, EOFError) as e:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                raise api_error(400, "validation",
+                                f"not a tar(.gz/.bz2/.xz) archive: {e}")
+            if dest.exists():
+                shutil.rmtree(dest)
+            tmpdir.rename(dest)
+        finally:
+            os.unlink(archive)
+
+        latest = root / "latest"
+        if latest.exists() or latest.is_symlink():
+            latest.unlink()
+        latest.symlink_to(version)
+        return {"name": name, "version": version, "bytes": total}
+
+    @app.get("/v1/datasets")
+    async def list_datasets(request: Request, princ=Depends(principal)):
+        request.state.princ = princ
+        root = datasets_root()
+        out = []
+        if root.is_dir():
+            for d in sorted(root.iterdir()):
+                if not d.is_dir() or d.name.startswith("."):
+                    continue
+                out.append({
+                    "name": d.name,
+                    "versions": dataset_versions(d.name),
+                    "latest": dataset_latest(d.name),
+                    "bytes": dir_bytes(d),
+                })
+        return {"datasets": out, "root": str(root)}
+
+    @app.get("/v1/datasets/{name}/{version}/manifest")
+    async def dataset_manifest(request: Request, name: str, version: str,
+                               princ=Depends(principal)):
+        request.state.princ = princ
+        sched: Scheduler = request.app.state.sched
+        try:
+            d = sched.resolve_dataset(name, version)
+        except FileNotFoundError as e:
+            raise api_error(404, "not_found", str(e))
+        mf = d / "manifest.json"
+        if not mf.is_file():
+            raise api_error(404, "not_found", "no manifest.json in bundle")
+        return FileResponse(mf)
+
+    @app.delete("/v1/datasets/{name}/{version}")
+    async def delete_dataset(request: Request, name: str, version: str,
+                             princ=Depends(principal)):
+        request.state.princ = princ
+        sched: Scheduler = request.app.state.sched
+        try:
+            d = sched.resolve_dataset(name, version)
+        except FileNotFoundError as e:
+            raise api_error(404, "not_found", str(e))
+        db: DB = request.app.state.db
+        rp = str(d.resolve())
+        for t in db.running_tasks():
+            for s in json.loads(t["datasets_json"] or "[]"):
+                if s.get("resolved_dir") == rp:
+                    raise api_error(409, "conflict",
+                                    f"in use by running task {t['id']}")
+        shutil.rmtree(d)
+        if dataset_latest(name) == version:
+            link = datasets_root() / name / "latest"
+            link.unlink(missing_ok=True)
+            rest = dataset_versions(name)
+            if rest:
+                link.symlink_to(rest[-1])
+        if not dataset_versions(name):
+            shutil.rmtree(datasets_root() / name, ignore_errors=True)
+        return {"ok": True}
 
     # ----------------------------------------------------------------- status
 

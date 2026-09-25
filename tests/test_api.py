@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import subprocess
+import tarfile
 import time
 from pathlib import Path
 
@@ -380,6 +382,90 @@ def test_task_path_extra(client):
     t = wait_terminal(client, tid)
     assert t["status"] == "succeeded", t.get("error")
     assert "tool-ran" in stdout_of(client, tid)
+
+
+# ------------------------------------------------------------------ datasets
+
+
+def make_tar(files: dict[str, str]) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tf:
+        for name, content in files.items():
+            data = content.encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def upload(client, name, version, files, headers=H_PROJ):
+    return client.post(
+        f"/v1/datasets/{name}?version={version}",
+        content=make_tar(files),
+        headers={**headers, "Content-Type": "application/x-tar"},
+    )
+
+
+def test_dataset_upload_and_env_injection(client):
+    r = upload(client, "mydata", "v1", {"data.txt": "hello-data"})
+    assert r.status_code == 201, r.text
+    ds = client.get("/v1/datasets", headers=H_PROJ).json()["datasets"]
+    assert ds[0]["name"] == "mydata" and ds[0]["latest"] == "v1"
+
+    r = submit(client, {
+        "project": "testproj",
+        "command": "cat $DS_DIR/data.txt",
+        "datasets": [{"name": "mydata", "env": "DS_DIR"}]})
+    tid = r.json()["tasks"][0]["task_id"]
+    t = wait_terminal(client, tid)
+    assert t["status"] == "succeeded", t.get("error")
+    assert "hello-data" in stdout_of(client, tid)
+    # no version requested → latest resolved to v1 at admit time, recorded
+    spec = t["datasets"][0]
+    assert spec.get("version") is None and spec["resolved_version"] == "v1" \
+        and spec["resolved_dir"].endswith("v1")
+
+
+def test_dataset_version_pinning(client):
+    upload(client, "ds", "v1", {"f": "one"})
+    upload(client, "ds", "v2", {"f": "two"})
+    r = submit(client, {
+        "project": "testproj", "command": "cat $D/f",
+        "datasets": [{"name": "ds", "version": "v1", "env": "D"}]})
+    t = wait_terminal(client, r.json()["tasks"][0]["task_id"])
+    assert "one" in stdout_of(client, t["id"])
+
+
+def test_dataset_missing_fails_fast(client):
+    r = submit(client, {"project": "testproj", "command": "true",
+                        "datasets": [{"name": "nonexistent"}]})
+    t = wait_terminal(client, r.json()["tasks"][0]["task_id"])
+    assert t["status"] == "failed"
+    assert "nonexistent" in (t["error"] or "")
+
+
+def test_dataset_in_use_not_deleted(client):
+    upload(client, "busy", "v1", {"f": "x"})
+    r = submit(client, {"project": "testproj", "command": "sleep 30",
+                        "datasets": [{"name": "busy", "env": "D"}]})
+    tid = r.json()["tasks"][0]["task_id"]
+    for _ in range(40):
+        if client.get(f"/v1/tasks/{tid}", headers=H_PROJ).json()["status"] == "running":
+            break
+        time.sleep(0.5)
+    r = client.delete("/v1/datasets/busy/v1", headers=H_ADMIN)
+    assert r.status_code == 409
+    client.post(f"/v1/tasks/{tid}/cancel", headers=H_PROJ)
+    wait_terminal(client, tid, timeout=30)
+
+
+def test_dataset_bad_tar_rejected(client):
+    r = client.post("/v1/datasets/bad?version=v1", content=b"not a tar",
+                    headers=H_PROJ)
+    assert r.status_code == 400
+    # path-escape member rejected by the data filter
+    r = upload(client, "evil", "v1", {"../escape.txt": "x"})
+    assert r.status_code == 400
 
 
 def test_cgroup_scope_when_available(client):

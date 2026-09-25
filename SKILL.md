@@ -32,6 +32,12 @@ guessing.
 - `GET /v1/tasks/{id}/files/{path}?root=artifacts` — download file
 - `POST /v1/tasks/{id}/cancel`, `POST /v1/tasks/cancel {"label": "..."}`
 - `GET /v1/queue` — pool utilization; `GET /v1/health`
+- `POST /v1/datasets/{name}?version=V` — upload a `.tar`/`.tar.gz` bundle
+  (raw body; `?replace=1` to overwrite an existing version)
+- `GET /v1/datasets` — list names/versions/sizes
+- `GET /v1/datasets/{name}/{version}/manifest` — the bundle's manifest.json
+- `DELETE /v1/datasets/{name}/{version}` — remove a version (409 if a running
+  task is using it)
 
 ## Task object
 
@@ -59,7 +65,10 @@ guessing.
   "labels": ["batch:myrun", "key:tw05"],
   "idempotency_key": "myrun-tw05-<commit>",
   "artifact_patterns": ["out/**", "*.png"],    // collected into artifacts/
-  "verdict_pattern": "MATCH|NEW_DIFF|..."      // last match in stdout tail → verdict
+  "verdict_pattern": "MATCH|NEW_DIFF|...",     // last match in stdout tail → verdict
+  "datasets": [{"name": "earth-real-data",     // shared read-only bundles;
+               "version": "latest",            //   omit for latest
+               "env": "WORLDGEN_DATA_DIR"}]    //   env var ← resolved dir
 }
 ```
 
@@ -111,3 +120,24 @@ Check `verdict` and `exit_code` on completion.
 - **Sharding**: for embarrassingly-parallel work, submit per-item tasks (not
   pre-sharded bundles) so the pool packs them by estimate. Shard granularity
   should match your atomic unit of work.
+
+## Datasets (shared read-only data)
+
+Large inputs that aren't in git (generated worlds, fixtures, corpora) live in
+`datasets/<name>/<version>/` under the scheduler's data dir. Upload a tar:
+
+```bash
+tar -cf bundle.tar -C <dir> .            # or .tar.gz
+curl -X POST "$SCHED_URL/v1/datasets/earth-real-data?version=7" \
+  -H "Authorization: Bearer $SCHED_TOKEN" \
+  -H "Content-Type: application/x-tar" --data-binary @bundle.tar
+```
+
+Every upload bumps the `latest` pointer. A task declaring
+`"datasets": [{"name": "earth-real-data", "env": "WORLDGEN_DATA_DIR"}]` fails
+fast at admit if the dataset is missing, and gets `WORLDGEN_DATA_DIR` set to
+the resolved version dir. `SCHED_DATASETS_DIR` (the root) is always in the
+task env. Pin `"version": "7"` when a run must be reproducible; omit for
+latest. Version resolution happens at admit — like `repo.ref`, `latest`
+means "at dispatch," not "at submit." Carry a `manifest.json` in the bundle
+(version + sha256s) if your project verifies content.

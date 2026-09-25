@@ -22,6 +22,7 @@ data_dir = "~/.local/share/task-scheduler"
 # max_batch_size = 500
 # artifact_file_max_bytes = 104857600
 # artifact_total_max_bytes = 524288000
+# max_dataset_bytes = 21474836480    # cap on a single dataset upload (20 GB)
 
 # Containment: run each task in a systemd --user scope with CPUQuota/MemoryMax.
 # Falls back to process-group-only (unenforced hints) when systemd-run scopes
