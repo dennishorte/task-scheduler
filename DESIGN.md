@@ -293,22 +293,33 @@ setsid sh -c '
   stub runs inside a `systemd-run --user --scope` instead of `setsid` — the
   scope is the isolation boundary.)
 
-- Task env = service env + `env` + `secret_env` (0600 file), with
+- Task env = service env + defaults + `env` + `secret_env` (0600 file), with
   `task_path_extra` dirs (default `~/.local/bin`, `~/bin`, `~/.cargo/bin`)
-  prepended to PATH so user-level tools resolve by name.
+  prepended to PATH so user-level tools resolve by name. Defaults:
+  `PYTHONUNBUFFERED=1`, `TMPDIR`/`TASK_TMPDIR` → a per-task scratch dir
+  under the task dir (cleaned at retention), `SCHED_DATASETS_DIR` → the
+  dataset root. Commands run under `stdbuf -oL -eL` so line-buffered output
+  survives SIGKILL — a timeout no longer means an empty log.
 
 ### 6.1a Datasets
 
 Named, versioned read-only data bundles for inputs too big for git
 (generated worlds, corpora). `POST /v1/datasets/{name}?version=` uploads a
 tar bundle to `data_dir/datasets/{name}/{version}/` with an auto-bumped
-`latest` symlink. Tasks declare `datasets: [{name, version?, env?}]`; at
-admit the scheduler resolves each spec (fail-fast if missing), records
+`latest` symlink (`?replace=1` overwrites; `?sha256=` verifies the archive
+against a client-supplied digest). Tasks declare
+`datasets: [{name, version?, env?, writable?}]`; at admit the scheduler
+resolves each spec (fail-fast if missing), records
 `resolved_version`/`resolved_dir`, and injects `env` → resolved dir into the
-task's environment (`SCHED_DATASETS_DIR` is always set to the root). The
+task's environment (`SCHED_DATASETS_DIR` is always set to the root).
+`writable: true` resolves to a per-task `cp -a --reflink=auto` copy under
+the task dir (CoW where the fs supports it), removed at finalize. The
 bundle layout and any `manifest.json` (version + sha256s) is the project's
 contract — the scheduler just hosts and pins the bytes. Delete is refused
 while a running task references the version.
+
+- The task record carries `stderr_tail` (last ~512 chars) so failures triage
+  from `GET /tasks/{id}` alone.
 
 - stdout/stderr → `stdout.log`/`stderr.log`. On reaching `log_max_bytes`
   (config, 64 MB): append a truncation marker line and **stop writing** —

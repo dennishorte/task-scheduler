@@ -257,6 +257,10 @@ class Scheduler:
         exitfile = PHASE_EXIT[phase]
         workdir = Path(task["workdir"])
         logcap = f"{shlex.quote(sys.executable)} -m task_scheduler.logcap"
+        # stdbuf line-buffers stdio via env vars that propagate to descendants,
+        # so a SIGKILLed task still leaves its latest output in the logs.
+        stdbuf = shutil.which("stdbuf")
+        wrap = f"{stdbuf} -oL -eL " if stdbuf else ""
         script = td / f"run_{phase}.sh"
         script.write_text(
             "#!/usr/bin/env bash\n"
@@ -265,7 +269,7 @@ class Scheduler:
             f" echo 'workdir unavailable: {workdir}' >> {shlex.quote(str(td / 'stderr.log'))};"
             f" echo 127 > {shlex.quote(str(td / exitfile))}; exit 127; }}\n"
             f"echo '===== {phase} phase =====' >> {shlex.quote(str(td / 'stdout.log'))}\n"
-            f"bash -c {shlex.quote(command)}"
+            f"{wrap}bash -c {shlex.quote(command)}"
             f" > >({logcap} {shlex.quote(str(td / 'stdout.log'))} {self.cfg.log_max_bytes})"
             f" 2> >({logcap} {shlex.quote(str(td / 'stderr.log'))} {self.cfg.log_max_bytes})\n"
             f"echo $? > {shlex.quote(str(td / exitfile))}\n"
@@ -273,22 +277,26 @@ class Scheduler:
         script.chmod(0o755)
 
         env = dict(os.environ)
+        env.setdefault("PYTHONUNBUFFERED", "1")  # killed tasks keep their tail
+        tmp = td / "tmp"                          # per-task scratch, cleaned
+        tmp.mkdir(exist_ok=True)                  # with the task dir
+        env["TMPDIR"] = env["TASK_TMPDIR"] = str(tmp)
+        env["SCHED_DATASETS_DIR"] = str(self.datasets_root())
         env.update(json.loads(task["env_json"] or "{}"))
         # Datasets resolved at admit inject their dir via the named env var.
         for s in json.loads(task["datasets_json"] or "[]"):
             if s.get("env") and s.get("resolved_dir"):
                 env[s["env"]] = s["resolved_dir"]
-        env["SCHED_DATASETS_DIR"] = str(self.datasets_root())
-        # Host tools (uv, cargo, …) live outside the service's minimal PATH —
-        # prepend configured dirs so tasks can call them by name.
-        extra = [str(Path(p).expanduser()) for p in self.cfg.task_path_extra]
-        env["PATH"] = ":".join([*extra, env.get("PATH", "")])
         secret_env = td / "secret_env.json"
         if secret_env.exists():
             try:
                 env.update(json.loads(secret_env.read_text()))
             except (OSError, json.JSONDecodeError):
                 pass
+        # Host tools (uv, cargo, …) live outside the service's minimal PATH —
+        # prepend configured dirs so tasks can call them by name.
+        extra = [str(Path(p).expanduser()) for p in self.cfg.task_path_extra]
+        env["PATH"] = ":".join([*extra, env.get("PATH", "")])
         runner_log = open(td / "runner.log", "ab")
 
         argv = ["setsid", "bash", str(script)]
@@ -420,9 +428,20 @@ class Scheduler:
         specs = json.loads(task["datasets_json"] or "[]")
         if not specs:
             return
+        td = self.task_dir(task["id"])
         for s in specs:
             d = self.resolve_dataset(s["name"], s.get("version"))
             s["resolved_version"] = d.name
+            if s.get("writable"):
+                # Per-task writable copy — reflink (CoW) where the fs supports
+                # it, plain copy otherwise. Cleaned up at finalize.
+                copy = td / "datasets" / s["name"]
+                copy.parent.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    ["cp", "-a", "--reflink=auto", str(d), str(copy)],
+                    check=True, capture_output=True, text=True, timeout=3600,
+                )
+                d = copy
             s["resolved_dir"] = str(d)
         js = json.dumps(specs)
         self.db.update_task(task["id"], datasets_json=js)
@@ -663,6 +682,17 @@ class Scheduler:
         verdict = self._scan_verdict(task, td)
         artifacts, skipped = self._collect_artifacts(task, td)
         self._cleanup_worktree(task)
+        shutil.rmtree(td / "datasets", ignore_errors=True)  # writable copies
+        # Last lines of stderr on the record, so failures triage in one request.
+        stderr_tail = ""
+        try:
+            with open(td / "stderr.log", "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 512))
+                stderr_tail = f.read().decode("utf-8", "replace").lstrip()[-512:]
+        except OSError:
+            pass
         err = error
         if skipped:
             err = (err + "; " if err else "") + "artifacts skipped: " + "; ".join(skipped)
@@ -675,6 +705,7 @@ class Scheduler:
             artifacts_json=json.dumps(artifacts),
             intended_status=None,
             error=err,
+            stderr_tail=stderr_tail,
         )
         self.db.add_event(task["id"], "running", status, f"exit_code={code}")
         if self._loop is not None:

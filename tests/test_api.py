@@ -468,6 +468,55 @@ def test_dataset_bad_tar_rejected(client):
     assert r.status_code == 400
 
 
+def test_dataset_writable(client):
+    upload(client, "rw", "v1", {"orig.txt": "seed"})
+    r = submit(client, {
+        "project": "testproj",
+        "command": "echo task-wrote > $D/new.txt && cat $D/orig.txt",
+        "datasets": [{"name": "rw", "env": "D", "writable": True}]})
+    t = wait_terminal(client, r.json()["tasks"][0]["task_id"])
+    assert t["status"] == "succeeded", t.get("error")
+    # task's write went to a private copy — the shared version is untouched
+    dsdir = client.app.state.sched.datasets_root() / "rw" / "v1"
+    assert not (dsdir / "new.txt").exists()
+    assert (dsdir / "orig.txt").read_text() == "seed"
+
+
+def test_dataset_upload_sha256(client):
+    tar = make_tar({"f": "bytes"})
+    good = hashlib.sha256(tar).hexdigest()
+    r = client.post(f"/v1/datasets/hashed?version=v1&sha256={good}",
+                    content=tar, headers=H_PROJ)
+    assert r.status_code == 201
+    r = client.post("/v1/datasets/hashed?version=v2&sha256=" + "0" * 64,
+                    content=tar, headers=H_PROJ)
+    assert r.status_code == 422
+    ds = client.get("/v1/datasets", headers=H_PROJ).json()["datasets"]
+    assert ds[0]["versions"] == ["v1"]  # failed upload left no version
+
+
+def test_task_env_defaults(client):
+    r = submit(client, {
+        "project": "testproj",
+        "command": "echo \"$TASK_TMPDIR|$TMPDIR|$PYTHONUNBUFFERED\"; "
+                   "touch $TASK_TMPDIR/scratch"})
+    tid = r.json()["tasks"][0]["task_id"]
+    t = wait_terminal(client, tid)
+    assert t["status"] == "succeeded", t.get("error")
+    out = stdout_of(client, tid)
+    tmpdir, tmpdir2, pyunbuf = out.strip().splitlines()[-1].split("|")
+    assert tmpdir == tmpdir2 and pyunbuf == "1"
+    assert (Path(tmpdir) / "scratch").exists()
+
+
+def test_stderr_tail_on_record(client):
+    r = submit(client, {"project": "testproj",
+                        "command": "echo oops-tail >&2; exit 3"})
+    t = wait_terminal(client, r.json()["tasks"][0]["task_id"])
+    assert t["status"] == "failed"
+    assert "oops-tail" in (t["stderr_tail"] or "")
+
+
 def test_cgroup_scope_when_available(client):
     sched = client.app.state.sched
     if not sched.cgroups:

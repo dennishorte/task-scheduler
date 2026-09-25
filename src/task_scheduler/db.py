@@ -69,7 +69,8 @@ class DB:
         self._conn.executescript(SCHEMA)
         # Lightweight migrations for columns added after v1.
         cols = {r[1] for r in self._conn.execute("PRAGMA table_info(tasks)")}
-        for col in ("repo_source", "secret_env_keys", "datasets_json"):
+        for col in ("repo_source", "secret_env_keys", "datasets_json",
+                    "stderr_tail"):
             if col not in cols:
                 self._conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
         self._conn.commit()

@@ -33,7 +33,8 @@ guessing.
 - `POST /v1/tasks/{id}/cancel`, `POST /v1/tasks/cancel {"label": "..."}`
 - `GET /v1/queue` — pool utilization; `GET /v1/health`
 - `POST /v1/datasets/{name}?version=V` — upload a `.tar`/`.tar.gz` bundle
-  (raw body; `?replace=1` to overwrite an existing version)
+  (raw body; `?replace=1` overwrites, `?sha256=<hex>` verifies the archive
+  server-side → 422 on mismatch)
 - `GET /v1/datasets` — list names/versions/sizes
 - `GET /v1/datasets/{name}/{version}/manifest` — the bundle's manifest.json
 - `DELETE /v1/datasets/{name}/{version}` — remove a version (409 if a running
@@ -68,12 +69,14 @@ guessing.
   "verdict_pattern": "MATCH|NEW_DIFF|...",     // last match in stdout tail → verdict
   "datasets": [{"name": "earth-real-data",     // shared read-only bundles;
                "version": "latest",            //   omit for latest
-               "env": "WORLDGEN_DATA_DIR"}]    //   env var ← resolved dir
+               "env": "WORLDGEN_DATA_DIR",     //   env var ← resolved dir
+               "writable": false}]             //   true → per-task writable copy
 }
 ```
 
 Status values: `queued running succeeded failed timeout cancelled lost`.
-Check `verdict` and `exit_code` on completion.
+Check `verdict`, `exit_code`, and `stderr_tail` (last ~500 chars of stderr —
+usually enough to triage a failure without fetching the log) on completion.
 
 ## Conventions (important)
 
@@ -99,9 +102,12 @@ Check `verdict` and `exit_code` on completion.
 - **Secrets go in `secret_env`, not `env`.** `env` is persisted in the DB and
   rendered in the dashboard; `secret_env` is passed to your process and never
   stored anywhere readable through the API.
-- **Task env is minimal but user tools are on PATH.** The service prepends
-  `~/.local/bin`, `~/bin`, `~/.cargo/bin` (config `task_path_extra`), so
-  `uv`, `cargo`, etc. resolve by name. Anything else: absolute path.
+- **Task env**: the service prepends `~/.local/bin`, `~/bin`, `~/.cargo/bin`
+  (config `task_path_extra`), so `uv`, `cargo`, etc. resolve by name.
+  `PYTHONUNBUFFERED=1` and `stdbuf -oL -eL` wrapping keep output flowing so
+  killed/timed-out tasks still leave their tail in the logs. `TMPDIR` and
+  `TASK_TMPDIR` point at a per-task scratch dir cleaned with the task —
+  **use them instead of `/tmp`**, which is shared across all tasks.
 - **Private repos: use the SSH URL form** (`git@github.com:org/repo.git`) —
   the service's ssh keys are available, but HTTPS URLs to private repos have
   no credential helper and fail with "could not read Username".
@@ -140,4 +146,23 @@ the resolved version dir. `SCHED_DATASETS_DIR` (the root) is always in the
 task env. Pin `"version": "7"` when a run must be reproducible; omit for
 latest. Version resolution happens at admit — like `repo.ref`, `latest`
 means "at dispatch," not "at submit." Carry a `manifest.json` in the bundle
-(version + sha256s) if your project verifies content.
+(version + sha256s) if your project verifies content; `?sha256=` on upload
+verifies the *archive* integrity server-side.
+
+**Datasets are read-only.** If your workload writes into its data root,
+declare `"writable": true` — the task gets a private copy of the version
+(CoW-reflink where the filesystem supports it) which is deleted when the
+task ends. Never write directly to a shared dataset dir.
+
+## Cookbook
+
+```bash
+# pytest lives in [project.optional-dependencies] dev:
+uv run --extra dev python -m pytest tests/unit -m "not slow"
+
+# datasets the task mutates → writable copy, no cp+chmod boilerplate:
+"datasets": [{"name": "ds", "env": "DATA", "writable": true}]
+
+# scratch space → $TASK_TMPDIR (per-task, cleaned), never shared /tmp:
+mktemp -d "$TASK_TMPDIR/work.XXXX"
+```

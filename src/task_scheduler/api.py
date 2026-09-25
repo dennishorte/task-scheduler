@@ -210,6 +210,8 @@ def validate_task(data: dict, cfg: Config, in_batch: bool,
                 isinstance(ev, str) and ENV_NAME_RE.match(ev)
             ):
                 errors.append(f"datasets[{i}].env: invalid env var name")
+            if "writable" in d and not isinstance(d["writable"], bool):
+                errors.append(f"datasets[{i}].writable: must be a bool")
 
     patterns = data.get("artifact_patterns", [])
     if not isinstance(patterns, list) or not all(isinstance(p, str) for p in patterns):
@@ -675,8 +677,10 @@ def create_app(config_path: str | Path) -> FastAPI:
 
     # -------------------------------------------------------------- datasets
     # Named, versioned read-only data bundles shared across tasks. Upload a
-    # tar archive; tasks reference {"name", "version"?, "env"?} and the
-    # resolved directory is injected as an env var at admit time.
+    # tar archive; tasks reference {"name", "version"?, "env"?, "writable"?}
+    # and the resolved directory is injected as an env var at admit time.
+    # "writable": true materializes a per-task copy (reflink where possible)
+    # under the task dir, cleaned up at finalize.
 
     def datasets_root() -> Path:
         return cfg.data_dir / "datasets"
@@ -708,11 +712,14 @@ def create_app(config_path: str | Path) -> FastAPI:
     async def upload_dataset(request: Request, name: str,
                              version: str | None = None,
                              replace: bool = False,
+                             sha256: str | None = None,
                              princ=Depends(principal)):
         request.state.princ = princ
         if not DATASET_NAME_RE.match(name):
             raise api_error(400, "validation",
                             f"bad dataset name ({DATASET_NAME_RE.pattern})")
+        if sha256 is not None and not re.fullmatch(r"[0-9a-fA-F]{64}", sha256):
+            raise api_error(400, "validation", "sha256 must be 64 hex chars")
         version = version or f"v{int(time.time())}"
         if not DATASET_NAME_RE.match(version):
             raise api_error(400, "validation", "bad version string")
@@ -726,6 +733,7 @@ def create_app(config_path: str | Path) -> FastAPI:
         # Stream the archive to disk first — bundles can be ~GBs.
         fd, archive = tempfile.mkstemp(dir=root, prefix=".upload-")
         total = 0
+        digest = hashlib.sha256()
         try:
             with os.fdopen(fd, "wb") as f:
                 async for chunk in request.stream():
@@ -733,7 +741,11 @@ def create_app(config_path: str | Path) -> FastAPI:
                     if total > cfg.max_dataset_bytes:
                         raise api_error(413, "too_large",
                                         f"dataset exceeds {cfg.max_dataset_bytes} bytes")
+                    digest.update(chunk)
                     f.write(chunk)
+            if sha256 is not None and digest.hexdigest() != sha256.lower():
+                raise api_error(422, "checksum_mismatch",
+                                "archive sha256 does not match ?sha256=")
             tmpdir = root / f".extracting-{secrets.token_hex(6)}"
             tmpdir.mkdir()
             try:
