@@ -1,0 +1,18 @@
+# systemd user unit — install to ~/.config/systemd/user/task-scheduler.service
+# then: systemctl --user daemon-reload && systemctl --user enable --now task-scheduler
+# linger for boot persistence: loginctl enable-linger $USER
+[Unit]
+Description=task-scheduler — shared CPU task scheduler
+After=network.target
+
+[Service]
+Type=simple
+# Children (task processes) must survive service restarts so the scheduler's
+# crash-recovery path can reconcile them — do NOT use control-group killing.
+KillMode=process
+ExecStart=%h/code/task-scheduler/.venv/bin/task-scheduler --config %h/.config/task-scheduler/scheduler.toml
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

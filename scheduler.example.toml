@@ -1,0 +1,39 @@
+# task-scheduler configuration — copy to ~/.config/task-scheduler/scheduler.toml
+
+bind = "127.0.0.1"          # set to LAN interface (e.g. "0.0.0.0") for remote agents
+port = 8377
+data_dir = "~/.local/share/task-scheduler"
+
+# Resource pool (defaults shown; usually fine to omit)
+# slots = 56                  # default: nproc - 8
+# mem_slots_mb = 70656        # default: total RAM - 8 GB
+
+# Defaults
+# default_est_seconds = 300
+# default_mem_mb = 2048
+# timeout_floor_seconds = 600
+# max_timeout_seconds = 129600   # 36h
+# setup_timeout_seconds = 600
+# log_max_bytes = 67108864       # 64 MB per stream
+# retention_days = 30
+# artifact_retention_days = 30   # defaults to retention_days; set lower to drop
+                               # artifacts sooner while keeping task records
+# min_free_gb = 10
+# max_batch_size = 500
+# artifact_file_max_bytes = 104857600
+# artifact_total_max_bytes = 524288000
+
+# Containment: run each task in a systemd --user scope with CPUQuota/MemoryMax.
+# Falls back to process-group-only (unenforced hints) when systemd-run scopes
+# are unavailable; check `degraded` in GET /v1/status.
+# enforce_cgroups = true
+
+# Admin token (UI, cross-project ops)
+admin_token = "CHANGE-ME-admin"
+
+# Per-project tokens and scheduling weight
+# [projects.slabpull]
+# token = "CHANGE-ME-slabpull"
+# weight = 1                    # relative fair-share weight when competing
+# default_mem_mb = 4096         # per-task default for this project
+# verdict_pattern = "MATCH|DIFF_RESOLVED|SKIP|NEW_DIFF|D1_MISMATCH"

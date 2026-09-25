@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>task-scheduler</title>
+<style>
+  :root { --bg:#0d1117; --fg:#e6edf3; --dim:#8b949e; --line:#30363d;
+          --ok:#3fb950; --run:#58a6ff; --warn:#d29922; --bad:#f85149; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  header { padding:12px 20px; border-bottom:1px solid var(--line);
+           display:flex; gap:24px; align-items:center; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; font-weight:600; }
+  .gauge { min-width:180px; }
+  .gauge .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; margin-top:4px; }
+  .gauge .bar > div { height:100%; background:var(--run); transition:width .4s; }
+  .gauge .lbl { color:var(--dim); font-size:11px; }
+  main { padding:16px 20px; max-width:1400px; margin:0 auto; }
+  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em;
+       color:var(--dim); margin:20px 0 8px; }
+  table { width:100%; border-collapse:collapse; }
+  th { text-align:left; color:var(--dim); font-weight:500; font-size:11px;
+       padding:4px 8px; border-bottom:1px solid var(--line); }
+  td { padding:5px 8px; border-bottom:1px solid #21262d; vertical-align:top; }
+  tr:hover td { background:#161b22; }
+  a { color:var(--run); text-decoration:none; }
+  .badge { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px;
+           border:1px solid var(--line); }
+  .b-queued { color:var(--dim); } .b-running { color:var(--run); border-color:var(--run); }
+  .b-succeeded { color:var(--ok); border-color:var(--ok); }
+  .b-failed,.b-timeout,.b-lost { color:var(--bad); border-color:var(--bad); }
+  .b-cancelled { color:var(--warn); border-color:var(--warn); }
+  .cmd { color:var(--dim); max-width:520px; overflow:hidden; text-overflow:ellipsis;
+         white-space:nowrap; display:inline-block; vertical-align:bottom; }
+  .prog { height:6px; background:var(--line); border-radius:3px; width:120px; overflow:hidden; }
+  .prog > div { height:100%; background:var(--ok); }
+  .prog.over > div { background:var(--bad); }
+  .muted { color:var(--dim); font-size:12px; }
+  button { background:#21262d; color:var(--fg); border:1px solid var(--line);
+           border-radius:5px; padding:2px 9px; font:inherit; font-size:11px; cursor:pointer; }
+  button:hover { border-color:var(--bad); color:var(--bad); }
+  .filters { display:flex; gap:10px; margin:0 0 4px; }
+  .filters select, .filters input { background:#0d1117; color:var(--fg);
+    border:1px solid var(--line); border-radius:5px; padding:3px 8px; font:inherit; font-size:12px; }
+  #log { background:#010409; border:1px solid var(--line); border-radius:6px;
+         padding:12px; white-space:pre-wrap; word-break:break-all; max-height:60vh;
+         overflow:auto; font-size:12px; }
+  .banner { background:#3d1d1d; border:1px solid var(--bad); color:var(--bad);
+            padding:8px 14px; border-radius:6px; margin-bottom:12px; }
+  .kv { display:grid; grid-template-columns:170px 1fr; gap:3px 14px; margin:10px 0; font-size:12px; }
+  .kv dt { color:var(--dim); } .kv dd { margin:0; word-break:break-all; }
+  .arts a { margin-right:14px; }
+  .arts img { max-width:420px; display:block; margin:8px 0; border:1px solid var(--line); }
+</style>
+</head>
+<body>
+<header>
+  <h1>task-scheduler</h1>
+  <div class="gauge"><div class="lbl" id="slots-lbl">slots</div><div class="bar"><div id="slots-bar"></div></div></div>
+  <div class="gauge"><div class="lbl" id="mem-lbl">memory</div><div class="bar"><div id="mem-bar"></div></div></div>
+  <div class="muted" id="uptime"></div>
+  <div class="muted" id="proj-summary"></div>
+</header>
+<main id="app"><p class="muted">loading…</p></main>
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let token = (localStorage.getItem('sched_token') || '').trim();
+
+// Single shared login form — never stack prompts across parallel requests.
+let loginPromise = null;
+function ensureToken() {
+  if (token) return Promise.resolve();
+  if (!loginPromise) {
+    loginPromise = new Promise((resolve) => {
+      $('#app').innerHTML = `
+        <form id="loginform" style="max-width:340px;margin:80px auto">
+          <h2>token</h2>
+          <input id="tok" type="password" autofocus
+                 style="width:100%;padding:6px;background:#0d1117;color:var(--fg);border:1px solid var(--line);border-radius:5px">
+          <button style="margin-top:8px">save</button>
+          <p class="muted">stored in localStorage</p>
+        </form>`;
+      $('#loginform').onsubmit = (e) => {
+        e.preventDefault();
+        token = $('#tok').value.trim();
+        localStorage.setItem('sched_token', token);
+        resolve();
+      };
+    }).finally(() => { loginPromise = null; });
+  }
+  return loginPromise;
+}
+
+async function api(path) {
+  await ensureToken();
+  let r = await fetch(path, {headers: {Authorization: 'Bearer ' + token}});
+  if (r.status === 401) {
+    token = '';
+    localStorage.removeItem('sched_token');
+    await ensureToken();
+    r = await fetch(path, {headers: {Authorization: 'Bearer ' + token}});
+  }
+  if (!r.ok) throw new Error((await r.json().catch(() => ({})))?.error?.message || r.status);
+  return r.json();
+}
+
+const fmtDur = (s) => s == null ? '—' :
+  s >= 3600 ? (s/3600).toFixed(1)+'h' : s >= 60 ? (s/60).toFixed(0)+'m' : s.toFixed(0)+'s';
+const elapsed = (t) => t.started_at ? (Date.now() - Date.parse(t.started_at))/1000 : null;
+const dur = (t) => t.ended_at && t.started_at ?
+  (Date.parse(t.ended_at) - Date.parse(t.started_at))/1000 : elapsed(t);
+
+function badge(t) {
+  let b = `<span class="badge b-${t.status}">${t.status}</span>`;
+  if (t.verdict) {
+    const v = String(t.verdict);
+    const shown = v.length > 48 ? v.slice(0, 48) + '…' : v;
+    b += ` <span class="badge" title="${esc(v)}">${esc(shown)}</span>`;
+  }
+  return b;
+}
+function progbar(t) {
+  if (t.status !== 'running' || !t.est_seconds) return '';
+  const e = elapsed(t), p = Math.min(100, 100*e/t.est_seconds);
+  return `<div class="prog ${e > t.est_seconds ? 'over':''}"><div style="width:${p}%"></div></div>`;
+}
+function row(t, cols) {
+  return `<tr>${cols.map(c => `<td>${c}</td>`).join('')}</tr>`;
+}
+function taskRow(t, showCancel) {
+  return row(t, [
+    badge(t), esc(t.project),
+    `<a href="#/tasks/${t.id}">${esc(t.id.slice(0,14))}…</a>`,
+    `<span class="cmd" title="${esc(t.command)}">${esc(t.command)}</span>`,
+    t.cores, fmtDur(dur(t)) + (t.status==='running' ? ' / ' + fmtDur(t.est_seconds) : ''),
+    progbar(t),
+    showCancel ? `<button onclick="cancelTask('${t.id}')">cancel</button>` : (t.exit_code ?? ''),
+  ]);
+}
+
+async function cancelTask(id) {
+  await fetch(`/v1/tasks/${id}/cancel`, {method:'POST',
+    headers:{Authorization:'Bearer ' + token}});
+  refresh();
+}
+
+async function dashboard() {
+  const [q, running, queued, done] = await Promise.all([
+    api('/v1/queue'),
+    api('/v1/tasks?status=running&limit=200'),
+    api('/v1/tasks?status=queued&limit=200'),
+    api('/v1/tasks?limit=50'),
+  ]);
+  $('#slots-lbl').textContent = `slots ${q.slots.used}/${q.slots.total}`;
+  $('#slots-bar').style.width = 100*q.slots.used/q.slots.total + '%';
+  $('#mem-lbl').textContent = `mem ${Math.round(q.mem_mb.used/1024)}/${Math.round(q.mem_mb.total/1024)} GB`;
+  $('#mem-bar').style.width = 100*q.mem_mb.used/q.mem_mb.total + '%';
+  $('#uptime').textContent = 'up ' + fmtDur(q.uptime_seconds);
+  $('#proj-summary').textContent = Object.entries(q.projects)
+    .map(([p,c]) => `${p}:${c.running||0}r/${c.queued||0}q`).join('  ');
+
+  const completed = done.tasks.filter(t =>
+    !['queued','running'].includes(t.status));
+  const qTasks = [...queued.tasks].sort((a,b) =>
+    b.est_seconds - a.est_seconds || a.submitted_at.localeCompare(b.submitted_at));
+
+  $('#app').innerHTML = `
+    ${q.degraded.length ? `<div class="banner">degraded: ${q.degraded.join(', ')}</div>` : ''}
+    <h2>Running (${running.tasks.length})</h2>
+    <table><tr><th></th><th>project</th><th>id</th><th>command</th><th>cores</th><th>elapsed/est</th><th></th><th></th></tr>
+    ${running.tasks.map(t => taskRow(t, true)).join('')}</table>
+    <h2>Queued (${qTasks.length}) — dispatch order</h2>
+    <table><tr><th></th><th>project</th><th>id</th><th>command</th><th>cores</th><th>est</th><th></th><th></th></tr>
+    ${qTasks.map(t => taskRow(t, true)).join('')}</table>
+    <h2>Completed (recent ${completed.length})</h2>
+    <table><tr><th></th><th>project</th><th>id</th><th>command</th><th>cores</th><th>duration</th><th></th><th>exit</th></tr>
+    ${completed.map(t => taskRow(t, false)).join('')}</table>`;
+}
+
+async function detail(id) {
+  const t = await api('/v1/tasks/' + id);
+  const [logRes, files] = await Promise.all([
+    api(`/v1/tasks/${id}/log?stream=stdout&tail=65536`),
+    api(`/v1/tasks/${id}/files`).catch(() => ({files: []})),
+  ]);
+  const evs = (t.events || []);
+  $('#app').innerHTML = `
+    <p><a href="#/">← dashboard</a></p>
+    <h2>${badge(t)} ${esc(t.id)}</h2>
+    <dl class="kv">
+      <dt>project</dt><dd>${esc(t.project)}</dd>
+      <dt>command</dt><dd>${esc(t.command)}</dd>
+      <dt>workdir</dt><dd>${esc(t.workdir)}</dd>
+      ${t.repo ? `<dt>repo</dt><dd>${esc(JSON.stringify(t.repo))}</dd>` : ''}
+      <dt>cores / mem</dt><dd>${t.cores} / ${t.mem_mb} MB</dd>
+      <dt>est / timeout</dt><dd>${fmtDur(t.est_seconds)} / ${fmtDur(t.timeout_seconds)}</dd>
+      <dt>submitted</dt><dd>${esc(t.submitted_at)}</dd>
+      <dt>started → ended</dt><dd>${esc(t.started_at||'—')} → ${esc(t.ended_at||'—')}</dd>
+      <dt>exit code</dt><dd>${t.exit_code ?? '—'}${t.error ? ' · '+esc(t.error) : ''}</dd>
+      <dt>labels</dt><dd>${(t.labels||[]).map(esc).join(', ')||'—'}</dd>
+      <dt>idempotency</dt><dd>${esc(t.idempotency_key||'—')}</dd>
+    </dl>
+    ${['queued','running'].includes(t.status) ? `<button onclick="cancelTask('${t.id}')">cancel task</button>` : ''}
+    <h2>Artifacts (${files.files.length})</h2>
+    <div class="arts">${files.files.map(f => {
+      const u = `/v1/tasks/${id}/files/${encodeURIComponent(f.path)}?root=artifacts`;
+      const isImg = /\.(png|gif|jpe?g|webp)$/i.test(f.path);
+      return `<a href="${u}" target="_blank">${esc(f.path)}</a>` +
+             (isImg ? `<img data-art="${u}" loading="lazy">` : '');
+    }).join('') || '<span class="muted">none</span>'}</div>
+    <h2>stdout (tail)</h2><div id="log">${esc(logRes.data) || '(empty)'}</div>
+    <h2>stderr</h2><div id="log2" class="muted">…</div>`;
+  const err = await api(`/v1/tasks/${id}/log?stream=stderr&tail=32768`);
+  $('#log2').outerHTML = `<div id="log">${esc(err.data) || '(empty)'}</div>`;
+  const el = document.getElementById('log');
+  el.scrollTop = el.scrollHeight;
+  // <img>/<a> can't send Authorization — fetch artifacts as blobs
+  for (const img of document.querySelectorAll('img[data-art]')) {
+    const r = await fetch(img.dataset.art,
+      {headers: {Authorization: 'Bearer ' + token}});
+    if (r.ok) img.src = URL.createObjectURL(await r.blob());
+  }
+  for (const a of document.querySelectorAll('.arts a')) {
+    a.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const r = await fetch(a.href, {headers: {Authorization: 'Bearer ' + token}});
+      if (r.ok) window.open(URL.createObjectURL(await r.blob()));
+    });
+  }
+}
+
+let timer = null;
+async function refresh() {
+  try {
+    const m = location.hash.match(/^#\/tasks\/(.+)/);
+    if (m) await detail(m[1]); else await dashboard();
+  } catch (e) {
+    $('#app').innerHTML = `<div class="banner">${esc(e.message)}</div>`;
+  }
+}
+window.addEventListener('hashchange', refresh);
+refresh();
+timer = setInterval(refresh, 2500);
+</script>
+</body>
+</html>
