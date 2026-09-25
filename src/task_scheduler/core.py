@@ -274,6 +274,10 @@ class Scheduler:
 
         env = dict(os.environ)
         env.update(json.loads(task["env_json"] or "{}"))
+        # Host tools (uv, cargo, …) live outside the service's minimal PATH —
+        # prepend configured dirs so tasks can call them by name.
+        extra = [str(Path(p).expanduser()) for p in self.cfg.task_path_extra]
+        env["PATH"] = ":".join([*extra, env.get("PATH", "")])
         secret_env = td / "secret_env.json"
         if secret_env.exists():
             try:

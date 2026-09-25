@@ -164,8 +164,9 @@ POST /v1/tasks          (single object, or {"tasks": [...]} for batch)
   the **last** regex match as `task.verdict` (a key that runs twice in-process
   prints two verdicts; last wins so `D1_MISMATCH` can't hide behind an earlier
   `MATCH`). Per-project default in config; per-task override allowed.
-- `env` values are persisted and displayed in the UI — do not put secrets in
-  `env`. (A non-rendered `secret_env` field is deferred.)
+- `env` values are persisted and displayed in the UI — secrets belong in
+  `secret_env` (merged into the child's environment; stored only as a 0600
+  file in the task dir, never in the DB, API, or UI).
 
 ### 4.2 Timeout derivation
 
@@ -288,7 +289,13 @@ setsid sh -c '
 ```
 
   `setsid` → own process group; `pgid`/`exit_code` files make the task
-  recoverable after a service restart (§6.4).
+  recoverable after a service restart (§6.4). (Under cgroup enforcement the
+  stub runs inside a `systemd-run --user --scope` instead of `setsid` — the
+  scope is the isolation boundary.)
+
+- Task env = service env + `env` + `secret_env` (0600 file), with
+  `task_path_extra` dirs (default `~/.local/bin`, `~/bin`, `~/.cargo/bin`)
+  prepended to PATH so user-level tools resolve by name.
 
 - stdout/stderr → `stdout.log`/`stderr.log`. On reaching `log_max_bytes`
   (config, 64 MB): append a truncation marker line and **stop writing** —

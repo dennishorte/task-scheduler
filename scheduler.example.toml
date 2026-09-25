@@ -28,6 +28,10 @@ data_dir = "~/.local/share/task-scheduler"
 # are unavailable; check `degraded` in GET /v1/status.
 # enforce_cgroups = true
 
+# Prepended to every task's PATH — the service env has a minimal PATH, so
+# user-level tools (uv, cargo, mise) need their dirs listed to resolve by name.
+# task_path_extra = ["~/.local/bin", "~/bin", "~/.cargo/bin"]
+
 # Admin token (UI, cross-project ops)
 admin_token = "CHANGE-ME-admin"
 

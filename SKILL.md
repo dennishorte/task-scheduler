@@ -12,7 +12,7 @@ machine. Every task runs in a private `git worktree` materialized from
 ## Endpoints
 
 Base URL: `SCHED_URL` (default `http://<scheduler-host>:8377`). All `/v1/*`
-requests need `Authorization: Bearer <project-token>`.
+requests need `Authorization: Bearer <scheduler-project-token>`.
 
 **Get the host, token, and project name from your project's `.env` file**
 (`SCHED_URL`, `SCHED_TOKEN`, `SCHED_PROJECT`) — don't hardcode them, and don't
@@ -43,8 +43,9 @@ guessing.
   "repo": {"url": "git@github.com:org/repo.git", "ref": "abc123"},   // REQUIRED
   //   The service clones/fetches the URL and creates a private git worktree
   //   at <ref> per task. SSH form for private repos — HTTPS has no
-  //   credentials. Branch names resolve at dispatch time — use a SHA to pin
-  //   an exact commit.
+  //   credentials. The ref must exist on the remote (push first — local-only
+  //   commits are invisible). Branch names resolve at dispatch time — use a
+  //   SHA to pin an exact commit.
   "workdir_subdir": "subdir",                  // optional, inside the worktree
   "env": {"K": "V"},                           // persisted + shown in UI
   "secret_env": {"API_KEY": "..."},            // runtime only — never stored
@@ -72,7 +73,10 @@ Check `verdict` and `exit_code` on completion.
   any shared checkout. **The ref resolves when the task *starts*, not when
   you submit** — `ref: "main"` queued for hours runs whatever `main` points
   to at dispatch. For an exact pin, submit the full **SHA**; a SHA never
-  moves. `file://` URLs work for repos already on the scheduler host.
+  moves, but **it must be pushed** — the service fetches from the remote, so
+  commits that exist only in your local clone are invisible. `file://` URLs
+  only work for repos on the **scheduler host's own disk** — from another
+  machine, use a URL the host can reach (`git@…`, `https://…`).
 - **Honest resource declarations**: `cores`/`mem_mb` are enforced through
   cgroup v2 scopes when available (CPU quota + MemoryMax — exceeding mem_mb
   OOM-kills your task). If you run `pytest -n 7`, declare `cores: 7` or you
@@ -86,6 +90,9 @@ Check `verdict` and `exit_code` on completion.
 - **Secrets go in `secret_env`, not `env`.** `env` is persisted in the DB and
   rendered in the dashboard; `secret_env` is passed to your process and never
   stored anywhere readable through the API.
+- **Task env is minimal but user tools are on PATH.** The service prepends
+  `~/.local/bin`, `~/bin`, `~/.cargo/bin` (config `task_path_extra`), so
+  `uv`, `cargo`, etc. resolve by name. Anything else: absolute path.
 - **Private repos: use the SSH URL form** (`git@github.com:org/repo.git`) —
   the service's ssh keys are available, but HTTPS URLs to private repos have
   no credential helper and fail with "could not read Username".

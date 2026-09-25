@@ -32,6 +32,7 @@ timeout_floor_seconds = 1
 max_timeout_seconds = 3600
 min_free_gb = 0
 retention_days = 30
+task_path_extra = ["{tmp_path}/toolbin"]
 admin_token = "admintok"
 ui_enabled = false
 
@@ -42,6 +43,10 @@ token = "testtok"
 token = "othertok"
 """
     )
+    tool = tmp_path / "toolbin" / "faketool"
+    tool.parent.mkdir()
+    tool.write_text("#!/bin/sh\necho tool-ran\n")
+    tool.chmod(0o755)
     app = create_app(cfg)
     with TestClient(app, raise_server_exceptions=True) as c:
         (tmp_path / "fixture").mkdir()
@@ -366,6 +371,15 @@ def test_learned_est(client):
     tid = r.json()["tasks"][0]["task_id"]
     t = client.get(f"/v1/tasks/{tid}", headers=H_PROJ).json()
     assert t["est_seconds"] < 60  # learned median ~seconds, not the 300s default
+
+
+def test_task_path_extra(client):
+    # A tool only reachable via task_path_extra resolves by name.
+    r = submit(client, {"project": "testproj", "command": "faketool"})
+    tid = r.json()["tasks"][0]["task_id"]
+    t = wait_terminal(client, tid)
+    assert t["status"] == "succeeded", t.get("error")
+    assert "tool-ran" in stdout_of(client, tid)
 
 
 def test_cgroup_scope_when_available(client):

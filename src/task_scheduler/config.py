@@ -45,6 +45,11 @@ class Config:
     max_batch_size: int = 500
     artifact_file_max_bytes: int = 100 * 1024 * 1024
     artifact_total_max_bytes: int = 500 * 1024 * 1024
+    # Prepended to every task's PATH so user-level tools (uv, cargo, mise…)
+    # resolve by name — the service env itself has a minimal PATH.
+    task_path_extra: list[str] = field(
+        default_factory=lambda: ["~/.local/bin", "~/bin", "~/.cargo/bin"]
+    )
     admin_token: str | None = None
     ui_enabled: bool = True
     enforce_cgroups: bool = True
@@ -89,6 +94,8 @@ def load_config(path: str | Path) -> Config:
 
     if "data_dir" in raw:
         cfg.data_dir = Path(raw.pop("data_dir")).expanduser()
+    if "task_path_extra" in raw:
+        cfg.task_path_extra = [str(p) for p in raw.pop("task_path_extra")]
 
     projects = raw.pop("projects", {})
     for name, pcfg in projects.items():
