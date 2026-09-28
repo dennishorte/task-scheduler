@@ -13,11 +13,11 @@ import tarfile
 import tempfile
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import __version__
@@ -855,6 +855,122 @@ def create_app(config_path: str | Path) -> FastAPI:
             "timestamp": iso(),
         }
 
+    @app.get("/v1/stats")
+    async def stats(request: Request, princ=Depends(principal)):
+        """Machine + pool utilization and per-project consumption stats."""
+        request.state.princ = princ
+        db: DB = request.app.state.db
+        sched: Scheduler = request.app.state.sched
+        used_slots, used_mem, _ = sched._usage()
+
+        dur = ("(julianday(replace(ended_at,'Z',''))"
+               " - julianday(replace(started_at,'Z',''))) * 86400.0")
+        wait = ("(julianday(replace(started_at,'Z',''))"
+                " - julianday(replace(submitted_at,'Z',''))) * 86400.0")
+        cutoff = iso(utcnow() - timedelta(hours=24))
+        rows = db.query(
+            f"""SELECT project, COUNT(*) n,
+                  SUM(status='succeeded') AS ok_n,
+                  SUM(status IN ('failed','timeout','lost')) AS fail_n,
+                  SUM(status='cancelled') AS cancel_n,
+                  SUM(CASE WHEN started_at IS NOT NULL AND ended_at IS NOT NULL
+                           THEN cores * {dur} ELSE 0 END) AS cpu_s,
+                  SUM(CASE WHEN started_at IS NOT NULL AND ended_at IS NOT NULL
+                           THEN mem_mb * {dur} ELSE 0 END) AS mem_s,
+                  SUM(CASE WHEN ended_at > ?
+                           AND started_at IS NOT NULL
+                           THEN cores * {dur} ELSE 0 END) AS cpu_s_24h,
+                  SUM(CASE WHEN ended_at > ?
+                           AND started_at IS NOT NULL
+                           THEN mem_mb * {dur} ELSE 0 END) AS mem_s_24h,
+                  COUNT(CASE WHEN ended_at > ? THEN 1 END) AS n_24h,
+                  AVG(CASE WHEN ended_at IS NOT NULL AND started_at IS NOT NULL
+                           THEN {dur} END) AS avg_dur_s,
+                  AVG(CASE WHEN started_at IS NOT NULL
+                           THEN {wait} END) AS avg_wait_s
+                FROM tasks
+                WHERE status IN ('succeeded','failed','timeout','cancelled','lost')
+                GROUP BY project""",
+            (cutoff, cutoff, cutoff))
+
+        # live queue breakdown
+        live = db.query(
+            "SELECT project, status, COUNT(*) AS n, SUM(cores) AS slot_sum,"
+            " SUM(mem_mb) AS mem_sum FROM tasks"
+            " WHERE status IN ('queued','running') GROUP BY project, status")
+
+        projects: dict[str, dict] = {}
+        for r in rows:
+            projects[r["project"]] = {
+                "tasks": r["n"], "tasks_24h": r["n_24h"],
+                "succeeded": r["ok_n"] or 0,
+                "failed": r["fail_n"] or 0,
+                "cancelled": r["cancel_n"] or 0,
+                "queued": 0, "running": 0,
+                "running_slots": 0, "running_mem_mb": 0,
+                "cpu_hours": round((r["cpu_s"] or 0) / 3600, 2),
+                "cpu_hours_24h": round((r["cpu_s_24h"] or 0) / 3600, 2),
+                "gb_hours": round((r["mem_s"] or 0) / 3600 / 1024, 2),
+                "gb_hours_24h": round((r["mem_s_24h"] or 0) / 3600 / 1024, 2),
+                "avg_duration_s": round(r["avg_dur_s"] or 0, 1),
+                "avg_wait_s": round(r["avg_wait_s"] or 0, 1),
+            }
+        for c in live:
+            p = projects.setdefault(c["project"], {
+                "tasks": 0, "tasks_24h": 0, "succeeded": 0, "failed": 0,
+                "cancelled": 0, "queued": 0, "running": 0,
+                "running_slots": 0, "running_mem_mb": 0,
+                "cpu_hours": 0, "cpu_hours_24h": 0,
+                "gb_hours": 0, "gb_hours_24h": 0,
+                "avg_duration_s": 0, "avg_wait_s": 0})
+            p[c["status"]] = c["n"]
+            if c["status"] == "running":
+                p["running_slots"] = c["slot_sum"] or 0
+                p["running_mem_mb"] = c["mem_sum"] or 0
+
+        # machine utilization (host-wide, not just the pool's slice)
+        cpus = os.cpu_count() or 1
+        try:
+            l1, l5, l15 = (float(x)
+                           for x in Path("/proc/loadavg").read_text().split()[:3])
+        except (OSError, ValueError):
+            l1 = l5 = l15 = None
+        mem_total = mem_avail = None
+        try:
+            info = {}
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                k, v = line.split(":", 1)
+                info[k] = int(v.split()[0])  # kB
+            mem_total = info.get("MemTotal", 0) // 1024
+            mem_avail = info.get("MemAvailable", 0) // 1024
+        except (OSError, ValueError):
+            pass
+
+        totals = {
+            "tasks": sum(p["tasks"] for p in projects.values()),
+            "cpu_hours": round(sum(p["cpu_hours"] for p in projects.values()), 2),
+            "gb_hours": round(sum(p["gb_hours"] for p in projects.values()), 2),
+            "cpu_hours_24h": round(
+                sum(p["cpu_hours_24h"] for p in projects.values()), 2),
+            "gb_hours_24h": round(
+                sum(p["gb_hours_24h"] for p in projects.values()), 2),
+        }
+        return {
+            "pool": {
+                "slots": {"total": cfg.slots, "used": used_slots},
+                "mem_mb": {"total": cfg.mem_slots_mb, "used": used_mem},
+            },
+            "machine": {
+                "cpus": cpus, "load1": l1, "load5": l5, "load15": l15,
+                "mem_total_mb": mem_total, "mem_avail_mb": mem_avail,
+                "mem_used_mb": (mem_total - mem_avail)
+                               if mem_total is not None else None,
+            },
+            "totals": totals,
+            "projects": projects,
+            "timestamp": iso(),
+        }
+
     @app.get("/v1/health")
     async def health(request: Request):
         sched: Scheduler | None = getattr(request.app.state, "sched", None)
@@ -867,6 +983,11 @@ def create_app(config_path: str | Path) -> FastAPI:
         @app.get("/", include_in_schema=False)
         async def ui_index():
             return FileResponse(STATIC_DIR / "index.html")
+
+        # Friendly URLs → the hash-routed SPA views.
+        @app.get("/stats", include_in_schema=False)
+        async def ui_stats():
+            return RedirectResponse("/#/stats")
 
         @app.get("/ui/{path:path}", include_in_schema=False)
         async def ui_spa(path: str):

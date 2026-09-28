@@ -19,6 +19,13 @@ requests need `Authorization: Bearer <scheduler-project-token>`.
 commit them elsewhere. If `.env` lacks them, stop and ask rather than
 guessing.
 
+**The HTTP API is the only interface to the scheduler host.** Do not ssh,
+scp, rsync, or otherwise connect to the host directly — your credentials
+aren't provisioned there and the host is firewalled to API access only. If
+the API can't do what you need (missing data, unexplained failure, an
+endpoint that doesn't exist), stop and report the gap rather than working
+around it with direct host access.
+
 - `POST /v1/tasks` — submit one task object or `{"tasks": [...]}` (batch is
   atomic; `idempotency_key` **required** on batches)
 - `GET /v1/tasks/{id}` — task record (status, exit_code, verdict, timing)
@@ -32,6 +39,8 @@ guessing.
 - `GET /v1/tasks/{id}/files/{path}?root=artifacts` — download file
 - `POST /v1/tasks/{id}/cancel`, `POST /v1/tasks/cancel {"label": "..."}`
 - `GET /v1/queue` — pool utilization; `GET /v1/health`
+- `GET /v1/stats` — machine load/mem, pool usage, per-project task counts,
+  cpu·h and GB·h consumed (24h + all-time), avg wait/duration
 - `POST /v1/datasets/{name}?version=V` — upload a `.tar`/`.tar.gz` bundle
   (raw body; `?replace=1` overwrites, `?sha256=<hex>` verifies the archive
   server-side → 422 on mismatch)
@@ -80,6 +89,9 @@ usually enough to triage a failure without fetching the log) on completion.
 
 ## Conventions (important)
 
+- **API-only.** Everything — submit, poll, logs, artifacts, datasets — goes
+  through the endpoints above. Never attempt ssh/rsync/direct file access to
+  the scheduler host; if you hit a wall, report it instead of bypassing.
 - **`repo.url` + `repo.ref` is the only task mode.** The service gives your
   task a private `git worktree`, isolated from whatever other agents do to
   any shared checkout. **The ref resolves when the task *starts*, not when

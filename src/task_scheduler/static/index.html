@@ -58,6 +58,7 @@
 <body>
 <header>
   <h1>task-scheduler</h1>
+  <a href="#/">tasks</a><a href="#/stats">stats</a>
   <div class="gauge"><div class="lbl" id="slots-lbl">slots</div><div class="bar"><div id="slots-bar"></div></div></div>
   <div class="gauge"><div class="lbl" id="mem-lbl">memory</div><div class="bar"><div id="mem-bar"></div></div></div>
   <div class="muted" id="uptime"></div>
@@ -181,6 +182,53 @@ async function dashboard() {
     ${completed.map(t => taskRow(t, false)).join('')}</table>`;
 }
 
+async function statsView() {
+  const s = await api('/v1/stats');
+  const gb = (mb) => mb == null ? '—' : (mb/1024).toFixed(1) + ' GB';
+  const loadPct = s.machine.load1 == null ? 0
+      : Math.min(100, 100 * s.machine.load1 / s.machine.cpus);
+  const prows = Object.entries(s.projects).map(([name, p]) => row(p, [
+    `<b>${esc(name)}</b>`, p.running, p.queued, p.tasks, p.tasks_24h,
+    `${p.succeeded}/${p.failed}/${p.cancelled}`,
+    p.running_slots, `${(p.running_mem_mb/1024).toFixed(1)}`,
+    p.cpu_hours_24h, p.cpu_hours, p.gb_hours_24h, p.gb_hours,
+    fmtDur(p.avg_wait_s), fmtDur(p.avg_duration_s),
+  ])).join('');
+  const tp = {tasks: s.totals.tasks};
+  $('#app').innerHTML = `
+    <p><a href="#/">← dashboard</a></p>
+    <h2>Machine</h2>
+    <table>
+      <tr><th>load (1/5/15)</th><th>cpus</th><th>load/cpu</th><th>mem used</th><th>mem avail</th></tr>
+      <tr><td>${s.machine.load1?.toFixed(2) ?? '—'} / ${s.machine.load5?.toFixed(2) ?? '—'} / ${s.machine.load15?.toFixed(2) ?? '—'}</td>
+          <td>${s.machine.cpus}</td>
+          <td><div class="prog ${loadPct>90?'over':''}"><div style="width:${loadPct}%"></div></div></td>
+          <td>${gb(s.machine.mem_used_mb)}</td>
+          <td>${gb(s.machine.mem_avail_mb)}</td></tr>
+    </table>
+    <h2>Pool (declared)</h2>
+    <table>
+      <tr><th>slots</th><th>memory</th></tr>
+      <tr><td>${s.pool.slots.used}/${s.pool.slots.total}
+            <div class="prog"><div style="width:${100*s.pool.slots.used/s.pool.slots.total}%"></div></div></td>
+          <td>${gb(s.pool.mem_mb.used)}/${gb(s.pool.mem_mb.total)}
+            <div class="prog"><div style="width:${100*s.pool.mem_mb.used/s.pool.mem_mb.total}%"></div></div></td></tr>
+    </table>
+    <h2>Per project</h2>
+    <table>
+      <tr><th>project</th><th>run</th><th>queue</th><th>tasks</th><th>24h</th>
+          <th>ok/fail/canc</th><th>slots</th><th>mem GB</th>
+          <th>cpu·h 24h</th><th>cpu·h all</th><th>GB·h 24h</th><th>GB·h all</th>
+          <th>avg wait</th><th>avg dur</th></tr>
+      ${prows}
+      <tr><td><b>total</b></td><td colspan="3">${tp.tasks} tasks all-time</td>
+          <td colspan="4"></td>
+          <td>${s.totals.cpu_hours_24h}</td><td>${s.totals.cpu_hours}</td>
+          <td>${s.totals.gb_hours_24h}</td><td>${s.totals.gb_hours}</td>
+          <td colspan="2"></td></tr>
+    </table>`;
+}
+
 async function detail(id) {
   const t = await api('/v1/tasks/' + id);
   const [logRes, files] = await Promise.all([
@@ -237,7 +285,9 @@ let timer = null;
 async function refresh() {
   try {
     const m = location.hash.match(/^#\/tasks\/(.+)/);
-    if (m) await detail(m[1]); else await dashboard();
+    if (m) await detail(m[1]);
+    else if (location.hash === '#/stats') await statsView();
+    else await dashboard();
   } catch (e) {
     $('#app').innerHTML = `<div class="banner">${esc(e.message)}</div>`;
   }

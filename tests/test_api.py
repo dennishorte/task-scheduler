@@ -517,6 +517,20 @@ def test_stderr_tail_on_record(client):
     assert "oops-tail" in (t["stderr_tail"] or "")
 
 
+def test_stats_endpoint(client):
+    r = submit(client, {"project": "testproj",
+                        "command": "echo ok", "cores": 2, "mem_mb": 512})
+    tid = r.json()["tasks"][0]["task_id"]
+    wait_terminal(client, tid)
+    s = client.get("/v1/stats", headers=H_PROJ).json()
+    p = s["projects"]["testproj"]
+    assert p["tasks"] == 1 and p["succeeded"] == 1
+    assert p["cpu_hours"] >= 0 and p["avg_duration_s"] >= 0
+    assert s["pool"]["slots"]["total"] == 4
+    assert s["machine"]["cpus"] >= 1
+    assert s["totals"]["tasks"] == 1
+
+
 def test_cgroup_scope_when_available(client):
     sched = client.app.state.sched
     if not sched.cgroups:

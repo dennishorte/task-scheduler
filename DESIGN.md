@@ -395,6 +395,7 @@ cross-project ops + UI). Timestamps are ISO-8601 UTC with milliseconds
 | `GET /v1/datasets/{name}/{version}/manifest` | the bundle's `manifest.json` (project-side verify/publish contract) |
 | `DELETE /v1/datasets/{name}/{version}` | GC a version; 409 while a running task references it |
 | `GET /v1/queue` | slots used/free, mem used/free, per-project running/queued, uptime, `degraded` flags (e.g. low disk) |
+| `GET /v1/stats` | machine load/mem (`/proc`), pool usage, per-project task counts + cpu·h / GB·h consumed (24h + all-time), avg wait/duration — backs `#/stats` |
 | `GET /v1/health` | liveness + degradation |
 
 Errors: JSON `{"error": {"code": "…", "message": "…"}}`; codes `unauthorized`,
