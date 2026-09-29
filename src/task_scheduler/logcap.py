@@ -5,6 +5,7 @@ Usage: python -m task_scheduler.logcap <path> <max_bytes>
 Writes at most max_bytes to <path>, appends a truncation marker, then keeps
 reading stdin to /dev/null so the producing process is never SIGPIPE'd.
 """
+import os
 import sys
 
 MARKER = b"\n[scheduler] log truncated at cap\n"
@@ -14,9 +15,14 @@ def main() -> None:
     path, cap = sys.argv[1], int(sys.argv[2])
     written = 0
     capped = False
-    with open(path, "ab") as out:
+    # os.read (not BufferedReader.read) returns as soon as any data is
+    # available — .read(n) would block until n bytes or EOF, hiding running
+    # tasks' output. Writes are unbuffered so each chunk lands on disk
+    # immediately for the log endpoint to serve.
+    fd_in = sys.stdin.fileno()
+    with open(path, "ab", buffering=0) as out:
         while True:
-            chunk = sys.stdin.buffer.read(65536)
+            chunk = os.read(fd_in, 65536)
             if not chunk:
                 break
             if not capped:

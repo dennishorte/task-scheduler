@@ -34,7 +34,8 @@ around it with direct host access.
 - `GET /v1/tasks/wait?label=<l>&timeout=` — block until ALL tasks with label
   are terminal → `{"all_terminal", "by_status"}`
 - `GET /v1/tasks/{id}/log?stream=stdout|stderr&offset=&tail=` — logs
-  (`offset` for incremental follow, `tail` = last N bytes)
+  **stream live for running tasks**; pass `offset` (from `next_offset`) for
+  incremental follow, `tail` = last N bytes
 - `GET /v1/tasks/{id}/files?root=artifacts|workdir&prefix=` — list files
 - `GET /v1/tasks/{id}/files/{path}?root=artifacts` — download file
 - `POST /v1/tasks/{id}/cancel`, `POST /v1/tasks/cancel {"label": "..."}`

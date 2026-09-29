@@ -517,6 +517,26 @@ def test_stderr_tail_on_record(client):
     assert "oops-tail" in (t["stderr_tail"] or "")
 
 
+def test_log_streams_while_running(client):
+    """Log endpoint serves a running task's output incrementally."""
+    r = submit(client, {"project": "testproj",
+                        "command": "echo T1; sleep 8; echo T2; sleep 30"})
+    tid = r.json()["tasks"][0]["task_id"]
+    # wait for T1 to be emitted but while the task still runs
+    seen = ""
+    for _ in range(30):
+        st = client.get(f"/v1/tasks/{tid}", headers=H_PROJ).json()["status"]
+        seen = client.get(f"/v1/tasks/{tid}/log?stream=stdout",
+                          headers=H_PROJ).json()["data"]
+        if st == "running" and "T1" in seen and "T2" not in seen:
+            break
+        time.sleep(0.5)
+    else:
+        pytest.fail("log never showed T1 while task was still running")
+    client.post(f"/v1/tasks/{tid}/cancel", headers=H_PROJ)
+    wait_terminal(client, tid, timeout=30)
+
+
 def test_stats_endpoint(client):
     r = submit(client, {"project": "testproj",
                         "command": "echo ok", "cores": 2, "mem_mb": 512})
